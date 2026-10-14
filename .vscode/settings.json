@@ -1,0 +1,16 @@
+{
+    "files.autoSave": "afterDelay",
+    "workbench.colorTheme": "Vira Carbon",
+    "redhat.telemetry.enabled": false,
+    "workbench.iconTheme": "material-icon-theme",
+    "editor.tokenColorCustomizations": {},
+    "[dockercompose]": {
+        "yaml.format.enable": true,
+        "editor.insertSpaces": true,
+        "editor.tabSize": 2,
+        "editor.autoIndent": "advanced"
+    },
+    "files.associations": {
+        "*.yaml": "yaml"
+    }
+}
