@@ -21,6 +21,11 @@ static START: OnceLock<Instant> = OnceLock::new();
 const LLKHF_INJECTED: u32 = 0x10;
 const LLMHF_INJECTED: u32 = 0x01;
 
+/// Só descarta o que o próprio app injetou; entrada remota (AnyDesk etc.) também chega como "injetada".
+fn is_self(injected: bool, extra: usize) -> bool {
+    injected && extra == crate::SELF_MARK
+}
+
 fn emit(action: Action, pos: Option<(i32, i32)>) {
     let t_ms = START.get().map(|s| s.elapsed().as_millis() as u64).unwrap_or(0);
     if let Ok(guard) = SENDER.lock() {
@@ -33,7 +38,7 @@ fn emit(action: Action, pos: Option<(i32, i32)>) {
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-        if info.flags.0 & LLKHF_INJECTED == 0 {
+        if !is_self(info.flags.0 & LLKHF_INJECTED != 0, info.dwExtraInfo) {
             let state = match wparam.0 as u32 {
                 WM_KEYDOWN | WM_SYSKEYDOWN => Some(PressState::Down),
                 WM_KEYUP | WM_SYSKEYUP => Some(PressState::Up),
@@ -50,7 +55,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        if info.flags & LLMHF_INJECTED == 0 {
+        if !is_self(info.flags & LLMHF_INJECTED != 0, info.dwExtraInfo) {
             let hi = (info.mouseData >> 16) as u16;
             let button = |b, s| Some(Action::MouseButton { button: b, state: s });
             let action = match wparam.0 as u32 {

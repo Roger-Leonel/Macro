@@ -1895,7 +1895,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "korvon-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "iced",
  "korvon-core",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "korvon-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1916,7 +1916,7 @@ dependencies = [
 
 [[package]]
 name = "korvon-input"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "korvon-core",
  "windows 0.58.0",
