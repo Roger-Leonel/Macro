@@ -5,6 +5,7 @@ mod library;
 mod rows;
 mod schedule;
 mod theme;
+mod tray;
 
 use icons::{Icon, Icons};
 use iced::widget::{
@@ -12,7 +13,7 @@ use iced::widget::{
     Column, Space,
 };
 use schedule::Freq;
-use iced::{keyboard, time, Alignment, Element, Font, Length, Padding, Subscription, Task};
+use iced::{keyboard, time, window, Alignment, Element, Font, Length, Padding, Subscription, Task};
 use korvon_core::{play, Action, Macro, PlayOptions, PlayOutcome, PressState, Recorder, RecorderOptions};
 use korvon_input::{start_hooks, RawEvent, SendInputSink};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
+const VK_ESC: u16 = 0x1B; // para a gravação
 const VK_F9: u16 = 0x78; // gravar / parar gravação
 const VK_F10: u16 = 0x79; // reproduzir
 const VK_F11: u16 = 0x7A; // parar
@@ -121,7 +123,12 @@ enum Message {
     SchedDelay(String),
     SchedPick,
     SchedCreate,
-    SchedSelect(usize),
+    /// Linha da lista: macro (`None`) ou agendamento existente (`Some(tarefa)`).
+    SchedEdit(std::path::PathBuf, Option<String>),
+    /// Linha pendente (macro aberta, ainda sem agendamento criado).
+    SchedDraft(u32),
+    SchedDuplicate,
+    SchedToggle,
     SchedRunNow,
     SchedDelete,
 }
@@ -166,8 +173,8 @@ struct App {
     library: Vec<library::Item>,
     /// Tarefas existentes no Agendador.
     schedules: Vec<schedule::Entry>,
-    /// Índice em `library` da linha destacada (se a macro escolhida estiver na biblioteca).
-    sched_sel: Option<usize>,
+    /// Tarefa em edição; `None` = novo agendamento da macro escolhida.
+    editing: Option<String>,
     /// Macro escolhida para agendar (pelo Explorer ou pela lista); o formulário só aparece com ela.
     pending: Option<std::path::PathBuf>,
     sched_freq: Freq,
@@ -179,6 +186,23 @@ struct App {
     /// Atraso em segundos após o logon (só dígitos).
     sched_delay: String,
     sched_rx: Option<Receiver<SchedResult>>,
+    /// Linhas pendentes: macros abertas aguardando o agendamento ser finalizado.
+    drafts: Vec<Draft>,
+    /// Pendente em edição no formulário.
+    editing_draft: Option<u32>,
+    next_draft: u32,
+    tray: Option<tray_icon::TrayIcon>,
+}
+
+/// Macro aberta na aba Agendamentos com a configuração própria dela.
+struct Draft {
+    id: u32,
+    path: std::path::PathBuf,
+    freq: Freq,
+    time: String,
+    date: String,
+    days: [bool; 7],
+    delay: String,
 }
 
 fn shortcut(key: keyboard::Key, mods: keyboard::Modifiers) -> Option<Message> {
@@ -196,7 +220,7 @@ fn shortcut(key: keyboard::Key, mods: keyboard::Modifiers) -> Option<Message> {
 impl App {
     fn new() -> Self {
         let (hooks, status) = match start_hooks() {
-            Ok(rx) => (Some(rx), "Pronto. F9 grava, F10 reproduz, F11 para.".to_string()),
+            Ok(rx) => (Some(rx), "Pronto. F9 grava (ESC para a gravação), F10 reproduz, F11 para.".to_string()),
             Err(e) => (None, e),
         };
         let mut app = Self {
@@ -221,7 +245,7 @@ impl App {
             rows_dirty: false,
             library: Vec::new(),
             schedules: Vec::new(),
-            sched_sel: None,
+            editing: None,
             pending: None,
             sched_freq: Freq::Daily,
             sched_time: "08:00".into(),
@@ -229,6 +253,10 @@ impl App {
             sched_days: [true, true, true, true, true, false, false],
             sched_delay: "0".into(),
             sched_rx: None,
+            drafts: Vec::new(),
+            editing_draft: None,
+            next_draft: 1,
+            tray: None,
         };
         // `korvon-macro <arquivo.kmacro|arquivo.mrf>` abre o arquivo ao iniciar.
         if let Some(arg) = std::env::args_os().nth(1) {
@@ -265,19 +293,25 @@ impl App {
                 }
             }
             Message::SchedFreq(f) => self.sched_freq = f,
-            Message::SchedTimeText(t) => self.sched_time = mask_time(&t),
-            Message::SchedDateText(t) => self.sched_date = mask_date(&t),
+            // A máscara reescreve o texto (insere ':' / '/'); o cursor volta ao fim para não ficar para trás.
+            Message::SchedTimeText(t) => {
+                self.sched_time = mask_time(&t);
+                task = text_input::move_cursor_to_end(text_input::Id::new("sched-time"));
+            }
+            Message::SchedDateText(t) => {
+                self.sched_date = mask_date(&t);
+                task = text_input::move_cursor_to_end(text_input::Id::new("sched-date"));
+            }
             Message::SchedDelay(t) => {
                 self.sched_delay = t.chars().filter(char::is_ascii_digit).take(5).collect();
             }
             Message::SchedDay(i) => self.sched_days[i] = !self.sched_days[i],
             Message::SchedPick => self.sched_pick(),
             Message::SchedCreate => self.sched_create(),
-            Message::SchedSelect(i) => {
-                if let Some(p) = self.library.get(i).map(|m| m.path.clone()) {
-                    self.sched_open(p);
-                }
-            }
+            Message::SchedEdit(path, task) => self.sched_open(path, task),
+            Message::SchedDraft(id) => self.sched_open_draft(id),
+            Message::SchedDuplicate => self.sched_duplicate(),
+            Message::SchedToggle => self.sched_toggle(),
             Message::SchedRunNow => self.sched_run_now(),
             Message::SchedDelete => self.sched_delete(),
             Message::ToggleMenu => self.menu_open = !self.menu_open,
@@ -297,7 +331,7 @@ impl App {
             Message::Save => self.save(false),
             Message::SaveAs => self.save(true),
             Message::Quit => task = iced::exit(),
-            Message::Record => self.toggle_record(),
+            Message::Record => task = self.toggle_record(),
             Message::Play => self.start_play(),
             Message::SpeedChanged(s) => self.speed = s,
             Message::RepeatChanged(s) => self.repeat = s,
@@ -331,25 +365,98 @@ impl App {
         Some(library::Item { name: path.file_stem()?.to_str()?.to_string(), path })
     }
 
-    /// Agendamento existente da macro `name`, se houver.
-    fn entry_of(&self, name: &str) -> Option<&schedule::Entry> {
+    /// Agendamentos (tarefas) da macro `name`.
+    fn entries_of<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a schedule::Entry> + 'a {
         let name = schedule::clean_name(name);
-        self.schedules.iter().find(|e| e.name == name)
+        self.schedules.iter().filter(move |e| schedule::clean_name(&e.macro_name()) == name)
     }
 
-    /// Botão Agendar: abre o Explorer para escolher a macro.
+    fn entry_by_task(&self, task: &str) -> Option<&schedule::Entry> {
+        self.schedules.iter().find(|e| e.name == task)
+    }
+
+    /// Agendamento em edição, se for um já existente.
+    fn editing_entry(&self) -> Option<&schedule::Entry> {
+        self.editing.as_deref().and_then(|t| self.entry_by_task(t))
+    }
+
+    /// Botão Abrir Macro: escolhe a macro e já a coloca na lista como pendente.
     fn sched_pick(&mut self) {
         if let Some(p) = dialog_in_library().add_filter("Korvon Macro", &["kmacro"]).pick_file() {
-            self.sched_open(p);
+            self.stash_draft();
+            self.add_draft(p, false);
         }
     }
 
-    /// Escolhe a macro e carrega no formulário o agendamento dela (se já houver um).
-    fn sched_open(&mut self, path: std::path::PathBuf) {
-        self.sched_sel = self.library.iter().position(|m| m.path == path);
+    /// Guarda no rascunho em edição o que está no formulário.
+    fn stash_draft(&mut self) {
+        let Some(id) = self.editing_draft else { return };
+        let (freq, time, date, days, delay) =
+            (self.sched_freq, self.sched_time.clone(), self.sched_date.clone(), self.sched_days, self.sched_delay.clone());
+        if let Some(d) = self.drafts.iter_mut().find(|d| d.id == id) {
+            (d.freq, d.time, d.date, d.days, d.delay) = (freq, time, date, days, delay);
+        }
+    }
+
+    /// Cria uma linha pendente (em branco ou com a configuração atual do formulário) e a seleciona.
+    fn add_draft(&mut self, path: std::path::PathBuf, copy_form: bool) {
+        let id = self.next_draft;
+        self.next_draft += 1;
+        let d = if copy_form {
+            Draft {
+                id,
+                path,
+                freq: self.sched_freq,
+                time: self.sched_time.clone(),
+                date: self.sched_date.clone(),
+                days: self.sched_days,
+                delay: self.sched_delay.clone(),
+            }
+        } else {
+            Draft {
+                id,
+                path,
+                freq: Freq::Daily,
+                time: "08:00".into(),
+                date: String::new(),
+                days: [true, true, true, true, true, false, false],
+                delay: "0".into(),
+            }
+        };
+        self.drafts.push(d);
+        self.sched_open_draft(id);
+    }
+
+    fn sched_open_draft(&mut self, id: u32) {
+        if self.editing_draft != Some(id) {
+            self.stash_draft();
+        }
+        let Some(d) = self.drafts.iter().find(|d| d.id == id) else { return };
+        let (path, freq, time, date, days, delay) = (d.path.clone(), d.freq, d.time.clone(), d.date.clone(), d.days, d.delay.clone());
         self.pending = Some(path);
+        self.editing = None;
+        self.editing_draft = Some(id);
+        (self.sched_freq, self.sched_time, self.sched_date, self.sched_days, self.sched_delay) = (freq, time, date, days, delay);
+        if let Some(item) = self.selected_macro() {
+            self.status = format!("Macro \"{}\": defina quando executar e clique em Finalizar agendamento.", item.name);
+        }
+    }
+
+    /// Duplicar: nova linha pendente da mesma macro, começando com a configuração atual.
+    fn sched_duplicate(&mut self) {
+        let Some(path) = self.pending.clone() else { return };
+        self.stash_draft();
+        self.add_draft(path, true);
+    }
+
+    /// Escolhe a macro; com `task`, carrega no formulário aquele agendamento.
+    fn sched_open(&mut self, path: std::path::PathBuf, task: Option<String>) {
+        self.stash_draft();
+        self.editing_draft = None;
+        self.pending = Some(path);
+        self.editing = task;
         let Some(item) = self.selected_macro() else { return };
-        if let Some(info) = self.entry_of(&item.name).and_then(|e| e.info()) {
+        if let Some(info) = self.editing_entry().and_then(|e| e.info()) {
             self.sched_freq = info.freq;
             self.sched_time = format!("{:02}:{:02}", info.time.0, info.time.1);
             self.sched_date = if info.freq == Freq::Once {
@@ -401,8 +508,12 @@ impl App {
                 return;
             }
         };
+        let task = self.editing.clone();
+        let enabled = self.editing_entry().is_none_or(|e| e.enabled());
         let req = schedule::Request {
             name: &item.name,
+            task: task.as_deref(),
+            enabled,
             file: &file,
             freq: self.sched_freq,
             time,
@@ -413,9 +524,12 @@ impl App {
             repeat: self.repeat.trim().parse::<u32>().unwrap_or(1),
         };
         match schedule::create(&req) {
-            Ok(()) => {
+            Ok(_) => {
                 self.status = format!("\"{}\" agendada no Agendador de Tarefas do Windows.", item.name);
                 self.pending = None;
+                self.editing = None;
+                let done = self.editing_draft.take();
+                self.drafts.retain(|d| Some(d.id) != done);
                 self.refresh_schedules();
             }
             Err(e) => self.status = e,
@@ -423,17 +537,41 @@ impl App {
     }
 
     fn sched_run_now(&mut self) {
-        let Some(name) = self.selected_macro().map(|m| m.name) else { return };
-        self.status = match schedule::run_now(&name) {
+        let Some(task) = self.editing.clone() else { return };
+        let name = self.selected_macro().map(|m| m.name).unwrap_or_default();
+        self.status = match schedule::run_now(&task) {
             Ok(()) => format!("\"{name}\" iniciada."),
             Err(e) => format!("Falha ao executar \"{name}\": {e}"),
         };
     }
 
+    fn sched_toggle(&mut self) {
+        let Some(task) = self.editing.clone() else { return };
+        let enable = self.editing_entry().is_some_and(|e| !e.enabled());
+        let name = self.selected_macro().map(|m| m.name).unwrap_or_default();
+        self.status = match schedule::set_enabled(&task, enable) {
+            Ok(()) if enable => format!("Agendamento de \"{name}\" habilitado."),
+            Ok(()) => format!("Agendamento de \"{name}\" desabilitado."),
+            Err(e) => format!("Falha ao alterar o agendamento de \"{name}\": {e}"),
+        };
+        self.refresh_schedules();
+    }
+
     fn sched_delete(&mut self) {
-        let Some(name) = self.selected_macro().map(|m| m.name) else { return };
-        self.status = match schedule::delete(&name) {
-            Ok(()) => format!("Agendamento de \"{name}\" removido."),
+        if let Some(id) = self.editing_draft.take() {
+            self.drafts.retain(|d| d.id != id);
+            self.pending = None;
+            self.status = "Linha pendente removida.".into();
+            return;
+        }
+        let Some(task) = self.editing.clone() else { return };
+        let name = self.selected_macro().map(|m| m.name).unwrap_or_default();
+        self.status = match schedule::delete(&task) {
+            Ok(()) => {
+                self.pending = None;
+                self.editing = None;
+                format!("Agendamento de \"{name}\" removido.")
+            }
             Err(e) => format!("Falha ao remover o agendamento de \"{name}\": {e}"),
         };
         self.refresh_schedules();
@@ -468,12 +606,20 @@ impl App {
 
     fn tick(&mut self) -> Task<Message> {
         let mut scroll = false;
+        let mut tasks: Vec<Task<Message>> = vec![];
         // Eventos globais (hotkeys + gravação).
         let events: Vec<RawEvent> = match &self.hooks {
             Some(rx) => rx.try_iter().collect(),
             None => vec![],
         };
         for ev in events {
+            // ESC encerra a gravação (e não entra nela).
+            if self.mode == Mode::Recording && matches!(ev.action, Action::Key { vk: VK_ESC, .. }) {
+                if matches!(ev.action, Action::Key { state: PressState::Down, .. }) {
+                    tasks.push(self.stop());
+                }
+                continue;
+            }
             let hotkey = match ev.action {
                 Action::Key { vk, state } if matches!(vk, VK_F9 | VK_F10 | VK_F11) => Some((vk, state)),
                 _ => None,
@@ -481,9 +627,9 @@ impl App {
             if let Some((vk, state)) = hotkey {
                 if state == PressState::Down {
                     match vk {
-                        VK_F9 => self.toggle_record(),
+                        VK_F9 => tasks.push(self.toggle_record()),
                         VK_F10 => self.start_play(),
-                        _ => self.stop(),
+                        _ => tasks.push(self.stop()),
                     }
                 }
                 continue; // hotkeys nunca entram na gravação
@@ -543,29 +689,31 @@ impl App {
             self.status = format!("Gravando… {} ações", self.current.actions.len());
         }
         if scroll {
-            scrollable::snap_to(self.list_id.clone(), scrollable::RelativeOffset::END)
-        } else {
-            Task::none()
+            tasks.push(scrollable::snap_to(self.list_id.clone(), scrollable::RelativeOffset::END));
         }
+        Task::batch(tasks)
     }
 
-    fn toggle_record(&mut self) {
+    fn toggle_record(&mut self) -> Task<Message> {
         match self.mode {
             Mode::Idle => {
                 if self.hooks.is_none() {
-                    return;
+                    return Task::none();
                 }
                 self.current.actions.clear();
                 self.selected = None;
                 self.recorder = Some(Recorder::new(RecorderOptions::default()));
                 self.mode = Mode::Recording;
+                // Durante a gravação o app some da tela e fica só na área de notificação.
+                self.tray = tray::show();
+                window::get_oldest().and_then(|id| window::change_mode(id, window::Mode::Hidden))
             }
             Mode::Recording => self.stop(),
-            Mode::Playing => {}
+            Mode::Playing => Task::none(),
         }
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Task<Message> {
         match self.mode {
             Mode::Recording => {
                 if let Some(r) = self.recorder.take() {
@@ -575,10 +723,15 @@ impl App {
                     self.selected = None;
                 }
                 self.mode = Mode::Idle;
+                self.tray = None;
+                return window::get_oldest().and_then(|id| {
+                    window::change_mode(id, window::Mode::Windowed).chain(window::gain_focus(id))
+                });
             }
             Mode::Playing => self.cancel.store(true, Ordering::Relaxed),
             Mode::Idle => {}
         }
+        Task::none()
     }
 
     fn start_play(&mut self) {
@@ -683,7 +836,7 @@ impl App {
 
     // ------------------------------------------------------------------ view
 
-    /// Lista das macros da biblioteca, com o agendamento de cada uma.
+    /// Lista das macros da biblioteca: uma linha por agendamento (ou uma linha sem agendamento).
     fn schedules_table(&self) -> iced::widget::Container<'_, Message> {
         use theme::*;
         let head = |s: &'static str, w: u16| text(s).size(12).color(MUTED).width(Length::FillPortion(w));
@@ -696,26 +849,72 @@ impl App {
         .width(Length::Fill)
         .style(surface(HEADER, 0.0, Some(BORDER)));
 
-        let mut lines: Vec<Element<Message>> = self
-            .library
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let cell = |s: String, w: u16| text(s).size(13).width(Length::FillPortion(w));
-                let entry = self.entry_of(&m.name);
-                let info = entry.and_then(|e| e.info());
-                let dash = || "—".to_string();
-                let state: Element<Message> = if entry.is_some() {
-                    container(text("Agendada").size(12).color(WHITE))
-                        .padding([2, 10])
-                        .style(surface(PLAY_GREEN, 10.0, None))
-                        .into()
-                } else {
-                    Space::new(0, 0).into()
-                };
+        // (nome, caminho, agendamento)
+        let mut entries: Vec<(String, std::path::PathBuf, Option<&schedule::Entry>)> = vec![];
+        for m in &self.library {
+            let mine: Vec<_> = self.entries_of(&m.name).collect();
+            if mine.is_empty() && !self.drafts.iter().any(|d| d.path == m.path) {
+                entries.push((m.name.clone(), m.path.clone(), None));
+            }
+            entries.extend(mine.into_iter().map(|e| (m.name.clone(), m.path.clone(), Some(e))));
+        }
+        // Agendamentos de macros que não estão (mais) na biblioteca.
+        let dir = library::dir().unwrap_or_default();
+        for e in &self.schedules {
+            let name = e.macro_name();
+            if !self.library.iter().any(|m| schedule::clean_name(&m.name) == schedule::clean_name(&name)) {
+                entries.push((name.clone(), dir.join(format!("{name}.kmacro")), Some(e)));
+            }
+        }
+
+        let badge = |label: &'static str, color| -> Element<Message> {
+            container(text(label).size(12).color(WHITE)).padding([2, 10]).style(surface(color, 10.0, None)).into()
+        };
+        let dash = || "—".to_string();
+        let mut lines: Vec<Element<Message>> = vec![];
+        for d in &self.drafts {
+            let name = d.path.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let live = self.editing_draft == Some(d.id);
+            let (freq, time, date) = if live {
+                (self.sched_freq, self.sched_time.clone(), self.sched_date.clone())
+            } else {
+                (d.freq, d.time.clone(), d.date.clone())
+            };
+            let cell = |s: String, w: u16| text(s).size(13).width(Length::FillPortion(w));
+            lines.push(
                 button(
                     row![
-                        cell(m.name.clone(), 4),
+                        cell(name, 4),
+                        cell(freq.to_string(), 4),
+                        cell(if freq == Freq::Logon { dash() } else { time }, 2),
+                        cell(if freq == Freq::Once { date } else { dash() }, 2),
+                        container(badge("Pendente", rgb_hex(0xe08a00))).width(Length::FillPortion(2)),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding([6, 8])
+                .width(Length::Fill)
+                .style(row_style(live, false))
+                .on_press(Message::SchedDraft(d.id))
+                .into(),
+            );
+        }
+        lines.extend(entries
+            .into_iter()
+            .map(|(name, path, entry)| {
+                let cell = |s: String, w: u16| text(s).size(13).width(Length::FillPortion(w));
+                let info = entry.and_then(|e| e.info());
+                let state: Element<Message> = match entry {
+                    Some(e) if e.enabled() => badge("Agendada", PLAY_GREEN),
+                    Some(_) => badge("Desabilitada", MUTED),
+                    None => Space::new(0, 0).into(),
+                };
+                let task = entry.map(|e| e.name.clone());
+                let selected = self.editing_draft.is_none() && self.pending.as_ref() == Some(&path) && self.editing == task;
+                button(
+                    row![
+                        cell(name, 4),
                         cell(info.as_ref().map_or_else(dash, |i| i.freq_label()), 4),
                         cell(info.as_ref().map_or_else(dash, |i| i.time_label()), 2),
                         cell(info.as_ref().map_or_else(dash, |i| i.date_label()), 2),
@@ -726,12 +925,11 @@ impl App {
                 )
                 .padding([6, 8])
                 .width(Length::Fill)
-                .style(row_style(self.sched_sel == Some(i), false))
-                .on_press(Message::SchedSelect(i))
+                .style(row_style(selected, false))
+                .on_press(Message::SchedEdit(path, task))
                 .into()
-            })
-            .collect();
-        if self.library.is_empty() {
+            }));
+        if lines.is_empty() {
             lines.push(
                 container(
                     text("Nenhuma macro na biblioteca. Grave uma macro e salve-a (Ctrl+S): ela aparecerá aqui para ser agendada.")
@@ -796,7 +994,7 @@ impl App {
                     row![
                         rbtn(ic, Icon::Play, "Reproduzir (F10)", Message::Play, idle && !self.current.actions.is_empty()),
                         if recording {
-                            rbtn(ic, Icon::Record, "Parar gravação (F9)", Message::Record, true)
+                            rbtn(ic, Icon::Record, "Parar gravação (ESC)", Message::Record, true)
                         } else {
                             rbtn(ic, Icon::Record, "Gravar (F9)", Message::Record, idle && self.hooks.is_some())
                         },
@@ -850,8 +1048,11 @@ impl App {
             .into(),
             Tab::Schedules => {
                 let sel = self.selected_macro();
-                let scheduled = sel.as_ref().is_some_and(|m| self.entry_of(&m.name).is_some());
-                let pick = rbtn(ic, Icon::Explorer, "Abrir Macro", Message::SchedPick, true);
+                let current = self.editing_entry();
+                let scheduled = current.is_some();
+                let removable = scheduled || self.editing_draft.is_some();
+                let is_enabled = current.is_none_or(|e| e.enabled());
+                let pick = rbtn_w(ic, Icon::Explorer, "Abrir Macro", Message::SchedPick, true, 90);
                 let form: Element<Message> = if sel.is_none() {
                     row![pick, text("Clique em Abrir Macro para escolher uma macro.").size(13).color(MUTED)]
                         .spacing(12)
@@ -867,6 +1068,7 @@ impl App {
                         form = form.push(field(
                             "Hora",
                             text_input("HH:MM", &self.sched_time)
+                                .id(text_input::Id::new("sched-time"))
                                 .on_input(Message::SchedTimeText)
                                 .style(input)
                                 .padding(6)
@@ -879,6 +1081,7 @@ impl App {
                             form = form.push(field(
                                 "Data",
                                 text_input("dd/mm/aaaa", &self.sched_date)
+                                    .id(text_input::Id::new("sched-date"))
                                     .on_input(Message::SchedDateText)
                                     .style(input)
                                     .padding(6)
@@ -910,18 +1113,34 @@ impl App {
                         }
                         _ => {}
                     }
-                    row![pick, form, rbtn(ic, Icon::Clock, "Finalizar agendamento", Message::SchedCreate, true)]
-                        .spacing(10)
-                        .align_y(Alignment::Center)
-                        .into()
+                    let name = sel.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+                    let title = if self.editing.is_some() { "Editando agendamento de" } else { "Novo agendamento de" };
+                    row![
+                        pick,
+                        column![
+                            row![text(format!("{title}:")).size(12).color(MUTED), text(name).size(14)].spacing(6),
+                            form
+                        ]
+                        .spacing(6),
+                        rbtn_w(ic, Icon::Clock, "Finalizar agendamento", Message::SchedCreate, true, 90)
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .into()
                 };
                 row![
                     group("Agendamento", form),
                     group(
                         "Gerenciar",
                         row![
-                            rbtn(ic, Icon::Play, "Executar agora", Message::SchedRunNow, scheduled),
-                            rbtn(ic, Icon::Delete, "Remover", Message::SchedDelete, scheduled),
+                            rbtn_w(ic, Icon::Play, "Executar agora", Message::SchedRunNow, scheduled, 90),
+                            if is_enabled {
+                                rbtn_w(ic, Icon::Stop, "Desabilitar", Message::SchedToggle, scheduled, 90)
+                            } else {
+                                rbtn_w(ic, Icon::Check, "Habilitar", Message::SchedToggle, scheduled, 90)
+                            },
+                            rbtn_w(ic, Icon::New, "Duplicar", Message::SchedDuplicate, sel.is_some(), 90),
+                            rbtn_w(ic, Icon::Delete, "Remover", Message::SchedDelete, removable, 90),
                         ]
                         .spacing(4)
                         .into()
@@ -946,7 +1165,8 @@ impl App {
                 group(
                     "Atalhos globais",
                     column![
-                        text("F9    gravar / parar gravação").size(13),
+                        text("F9    gravar (o app vai para a bandeja)").size(13),
+                        text("ESC   parar gravação").size(13),
                         text("F10   reproduzir").size(13),
                         text("F11   parar").size(13),
                     ]
@@ -971,7 +1191,7 @@ impl App {
         let ribbon = container(ribbon_row)
             .padding([8, 16])
             .width(Length::Fill)
-            .height(Length::Fixed(104.0))
+            .height(Length::Fixed(if self.tab == Tab::Schedules { 124.0 } else { 104.0 }))
             .style(surface(RIBBON, 0.0, Some(BORDER)));
 
         // --- Tabela de ações --------------------------------------------------
@@ -1211,10 +1431,15 @@ fn field<'a>(label: &str, content: Element<'a, Message>) -> Element<'a, Message>
 
 /// Botão grande da faixa de opções: ícone colorido sobre o rótulo.
 fn rbtn<'a>(icons: &Icons, ic: Icon, label: &'a str, msg: Message, enabled: bool) -> Element<'a, Message> {
+    rbtn_w(icons, ic, label, msg, enabled, 104)
+}
+
+/// Como `rbtn`, com largura própria (a aba Agendamentos usa botões mais estreitos).
+fn rbtn_w<'a>(icons: &Icons, ic: Icon, label: &'a str, msg: Message, enabled: bool, width: u16) -> Element<'a, Message> {
     let b = button(
         column![icons.get(ic, 34.0, enabled), text(label).size(12)]
             .spacing(5)
-            .width(Length::Fixed(104.0))
+            .width(Length::Fixed(width as f32))
             .align_x(Alignment::Center),
     )
     .padding([6, 4])

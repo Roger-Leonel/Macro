@@ -1,8 +1,8 @@
 //! Agendamento de macros no Agendador de Tarefas do Windows.
 //!
-//! Cada agendamento é uma tarefa em `\Korvon Macro\<nome>` que executa
-//! `korvon-macro.exe --run <arquivo.kmacro> --speed X --repeat N`, onde `<nome>` é o nome
-//! da macro da biblioteca. O Agendador é a fonte da verdade: frequência, hora, data e
+//! Cada agendamento é uma tarefa em `\Korvon Macro\<macro> (<id>)` que executa
+//! `korvon-macro.exe --run <arquivo.kmacro> --speed X --repeat N`. Uma macro pode ter
+//! vários agendamentos (um id diferente para cada). O Agendador é a fonte da verdade: frequência, hora, data e
 //! dias são lidos de volta da descrição da tarefa, sem índice próprio.
 
 use korvon_core::Macro;
@@ -14,7 +14,7 @@ use std::process::Command;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FOLDER: &str = "Korvon Macro";
-/// Prefixo da descrição legível por máquina: `KV1|freq|HH:MM|AAAA-MM-DD|dias|atraso`.
+/// Prefixo da descrição legível por máquina: `KV1|freq|HH:MM|AAAA-MM-DD|dias|atraso|macro`.
 const TAG: &str = "KV1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +58,11 @@ const DAY_XML: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Frida
 
 /// Tudo o que o formulário coleta.
 pub struct Request<'a> {
-    /// Nome da macro; também é o nome da tarefa.
+    /// Nome da macro.
     pub name: &'a str,
+    /// Tarefa existente a substituir; `None` cria um novo agendamento.
+    pub task: Option<&'a str>,
+    pub enabled: bool,
     pub file: &'a Path,
     pub freq: Freq,
     pub time: (u32, u32),
@@ -80,25 +83,28 @@ pub struct Info {
     pub date: (i32, u32, u32),
     pub days: [bool; 7],
     pub delay: u32,
+    /// Nome da macro agendada.
+    pub macro_name: String,
 }
 
 impl Info {
     fn encode(&self) -> String {
         let days: String = self.days.iter().map(|&d| if d { '1' } else { '0' }).collect();
         format!(
-            "{TAG}|{}|{:02}:{:02}|{:04}-{:02}-{:02}|{days}|{}",
+            "{TAG}|{}|{:02}:{:02}|{:04}-{:02}-{:02}|{days}|{}|{}",
             self.freq.code(),
             self.time.0,
             self.time.1,
             self.date.0,
             self.date.1,
             self.date.2,
-            self.delay
+            self.delay,
+            self.macro_name
         )
     }
 
     fn decode(s: &str) -> Option<Info> {
-        let p: Vec<&str> = s.split('|').collect();
+        let p: Vec<&str> = s.splitn(7, '|').collect();
         if p.len() < 5 || p[0] != TAG {
             return None;
         }
@@ -114,6 +120,7 @@ impl Info {
             date: (d.next()?.parse().ok()?, d.next()?.parse().ok()?, d.next()?.parse().ok()?),
             days,
             delay: p.get(5).and_then(|d| d.parse().ok()).unwrap_or(0),
+            macro_name: p.get(6).map(|m| m.to_string()).unwrap_or_default(),
         })
     }
 
@@ -150,9 +157,23 @@ pub struct Entry {
     pub name: String,
     #[serde(default)]
     desc: String,
+    #[serde(default)]
+    state: String,
 }
 
 impl Entry {
+    pub fn enabled(&self) -> bool {
+        self.state != "Disabled"
+    }
+
+    /// Macro agendada (tarefas antigas, sem o campo, usam o nome da tarefa).
+    pub fn macro_name(&self) -> String {
+        match self.info() {
+            Some(i) if !i.macro_name.is_empty() => i.macro_name,
+            _ => self.name.clone(),
+        }
+    }
+
     pub fn info(&self) -> Option<Info> {
         Info::decode(&self.desc)
     }
@@ -194,12 +215,21 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Cria (ou substitui) o agendamento da macro.
-pub fn create(req: &Request) -> Result<(), String> {
+fn new_id() -> String {
+    let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() ^ (d.as_secs() as u32)).unwrap_or(0);
+    format!("{:06x}", n & 0xff_ffff)
+}
+
+/// Cria (ou substitui, se `req.task` for informado) o agendamento. Devolve o nome da tarefa.
+pub fn create(req: &Request) -> Result<String, String> {
     let name = clean_name(req.name);
     if name.is_empty() {
         return Err("Macro sem nome.".into());
     }
+    let task = match req.task {
+        Some(t) => clean_name(t),
+        None => format!("{name} ({})", new_id()),
+    };
     let m = Macro::load(req.file).map_err(|e| format!("Erro ao abrir a macro: {e}"))?;
     if m.actions.is_empty() {
         return Err("A macro está vazia.".into());
@@ -237,7 +267,7 @@ pub fn create(req: &Request) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let speed = if req.speed.is_finite() && req.speed > 0.0 { req.speed } else { 1.0 };
     let arguments = format!("--run \"{}\" --speed {speed} --repeat {}", req.file.display(), req.repeat);
-    let info = Info { freq: req.freq, time: req.time, date: req.date, days: req.days, delay: req.delay };
+    let info = Info { freq: req.freq, time: req.time, date: req.date, days: req.days, delay: req.delay, macro_name: name.clone() };
 
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
@@ -251,10 +281,11 @@ pub fn create(req: &Request) -> Result<(), String> {
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>false</StartWhenAvailable>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Enabled>true</Enabled>
+    <Enabled>{enabled}</Enabled>
   </Settings>
   <Actions Context="Author"><Exec><Command>{cmd}</Command><Arguments>{args}</Arguments></Exec></Actions>
 </Task>"#,
+        enabled = req.enabled,
         desc = xml_escape(&info.encode()),
         cmd = xml_escape(&exe.display().to_string()),
         args = xml_escape(&arguments),
@@ -265,14 +296,20 @@ pub fn create(req: &Request) -> Result<(), String> {
     let xml_path = std::env::temp_dir().join(format!("korvon-task-{}.xml", std::process::id()));
     std::fs::write(&xml_path, bytes).map_err(|e| e.to_string())?;
 
-    let result = run("schtasks", &["/Create", "/TN", &task_path(&name), "/XML", &xml_path.display().to_string(), "/F"]);
+    let result = run("schtasks", &["/Create", "/TN", &task_path(&task), "/XML", &xml_path.display().to_string(), "/F"]);
     let _ = std::fs::remove_file(&xml_path);
-    result.map(|_| ()).map_err(|e| format!("O Agendador recusou a tarefa: {e}"))
+    result.map(|_| task).map_err(|e| format!("O Agendador recusou a tarefa: {e}"))
 }
 
 /// Remove o agendamento (a macro em si não é tocada).
 pub fn delete(name: &str) -> Result<(), String> {
     run("schtasks", &["/Delete", "/TN", &task_path(&clean_name(name)), "/F"]).map(|_| ())
+}
+
+/// Habilita ou desabilita (pausa) o agendamento sem apagá-lo.
+pub fn set_enabled(name: &str, enabled: bool) -> Result<(), String> {
+    let flag = if enabled { "/ENABLE" } else { "/DISABLE" };
+    run("schtasks", &["/Change", "/TN", &task_path(&clean_name(name)), flag]).map(|_| ())
 }
 
 pub fn run_now(name: &str) -> Result<(), String> {
@@ -284,7 +321,7 @@ pub fn list() -> Result<Vec<Entry>, String> {
     let script = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
          $t=@(Get-ScheduledTask -TaskPath '\\{FOLDER}\\' -ErrorAction SilentlyContinue); \
-         $r=@($t | ForEach-Object {{ [pscustomobject]@{{name=$_.TaskName;desc=[string]$_.Description}} }}); \
+         $r=@($t | ForEach-Object {{ [pscustomobject]@{{name=$_.TaskName;desc=[string]$_.Description;state=[string]$_.State}} }}); \
          ConvertTo-Json -InputObject $r -Compress"
     );
     let out = run("powershell", &["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])?;
@@ -308,9 +345,11 @@ mod tests {
             date: (2030, 12, 25),
             days: [true, false, true, false, false, false, true],
             delay: 45,
+            macro_name: "Minha | macro".into(),
         };
         let d = Info::decode(&i.encode()).unwrap();
         assert_eq!((d.freq, d.time, d.date, d.days, d.delay), (i.freq, i.time, i.date, i.days, 45));
+        assert_eq!(d.macro_name, "Minha | macro");
         assert_eq!(d.freq_label(), "Semanal (Seg, Qua, Dom)");
         assert!(Info::decode("lixo").is_none());
     }
@@ -321,8 +360,10 @@ mod tests {
     fn create_list_delete() {
         let file = std::env::temp_dir().join("zz-teste àç.kmacro");
         Macro::new("t", vec![Action::Wait { ms: 10 }]).save(&file).unwrap();
-        let req = |freq| Request {
+        let req = |freq, task| Request {
             name: "zz-teste àç",
+            task,
+            enabled: true,
             file: &file,
             freq,
             time: (8, 30),
@@ -332,14 +373,28 @@ mod tests {
             speed: 1.0,
             repeat: 1,
         };
+        let mut tasks = vec![];
         for f in Freq::ALL {
-            create(&req(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+            let t = create(&req(f, None)).unwrap_or_else(|e| panic!("{f}: {e}"));
             let l = list().unwrap();
-            let e = l.iter().find(|e| e.name == "zz-teste àç").unwrap_or_else(|| panic!("{f}: {l:?}"));
+            let e = l.iter().find(|e| e.name == t).unwrap_or_else(|| panic!("{f}: {l:?}"));
             assert_eq!(e.info().unwrap().freq, f);
+            assert_eq!(e.macro_name(), "zz-teste àç");
+            assert!(e.enabled());
+            tasks.push(t);
         }
-        delete("zz-teste àç").unwrap();
-        assert!(!list().unwrap().iter().any(|e| e.name == "zz-teste àç"));
+        // Quatro agendamentos distintos da mesma macro.
+        assert_eq!(tasks.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+        set_enabled(&tasks[0], false).unwrap();
+        assert!(!list().unwrap().iter().find(|e| e.name == tasks[0]).unwrap().enabled());
+        set_enabled(&tasks[0], true).unwrap();
+        assert!(list().unwrap().iter().find(|e| e.name == tasks[0]).unwrap().enabled());
+        // Substituir mantendo o nome da tarefa.
+        assert_eq!(create(&req(Freq::Daily, Some(&tasks[0]))).unwrap(), tasks[0]);
+        for t in &tasks {
+            delete(t).unwrap();
+        }
+        assert!(!list().unwrap().iter().any(|e| e.macro_name() == "zz-teste àç"));
         let _ = std::fs::remove_file(&file);
     }
 }

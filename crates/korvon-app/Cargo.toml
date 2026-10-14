@@ -16,3 +16,4 @@ serde_json.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 korvon-input = { path = "../korvon-input" }
+tray-icon = { version = "0.19", default-features = false }

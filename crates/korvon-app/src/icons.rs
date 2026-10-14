@@ -16,6 +16,7 @@ pub enum Icon {
     Play,
     Record,
     Stop,
+    Check,
     Delete,
     Up,
     Down,
@@ -56,6 +57,7 @@ fn body(i: Icon) -> String {
         Icon::Play => r##"<path d="M7 4l13 8-13 8z" fill="#4caf50" stroke="#2e7d32" stroke-width="1.2" stroke-linejoin="round"/>"##.into(),
         Icon::Record => r##"<circle cx="12" cy="12" r="9" fill="#ef5350" stroke="#c62828" stroke-width="1.2"/>"##.into(),
         Icon::Stop => r##"<rect x="4" y="4" width="16" height="16" rx="2" fill="#7fb0ea" stroke="#3b7dd6" stroke-width="1.2"/>"##.into(),
+        Icon::Check => r##"<circle cx="12" cy="12" r="9" fill="#4caf50" stroke="#2e7d32" stroke-width="1.2"/><path d="M7.5 12.5l3 3 6-6.5" stroke="#fff" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"##.into(),
         Icon::Delete => r##"<path d="M5 5l14 14M19 5L5 19" stroke="#e53935" stroke-width="3" stroke-linecap="round"/>"##.into(),
         Icon::Up => format!(r##"<path d="M12 19V6M6 11l6-6 6 6" stroke="{BLUE}" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"##),
         Icon::Down => format!(r##"<path d="M12 5v13M6 13l6 6 6-6" stroke="{BLUE}" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"##),
@@ -81,7 +83,7 @@ fn markup(i: Icon) -> Vec<u8> {
     format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">{}</svg>"#, body(i)).into_bytes()
 }
 
-const ALL: [Icon; 26] = [
+const ALL: [Icon; 27] = [
     Icon::New,
     Icon::Open,
     Icon::Explorer,
@@ -90,6 +92,7 @@ const ALL: [Icon; 26] = [
     Icon::Play,
     Icon::Record,
     Icon::Stop,
+    Icon::Check,
     Icon::Delete,
     Icon::Up,
     Icon::Down,
