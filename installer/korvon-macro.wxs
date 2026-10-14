@@ -20,6 +20,7 @@
         <Component Id="MainExe" Guid="*">
           <File Id="KorvonMacroExe" Source="$(ExePath)" KeyPath="yes">
             <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Korvon Macro" Advertise="yes" />
+            <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="Korvon Macro" Advertise="yes" />
           </File>
         </Component>
       </Directory>
