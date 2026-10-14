@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Instalador MSI do Korvon Macro (WiX v4+).
+  wix build installer\korvon-macro.wxs -arch x64 -d Version=1.0.0 -d ExePath=target\release\korvon-macro.exe -o dist\korvon-macro-1.0.0-x64.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Korvon Macro"
+           Manufacturer="Fórmula Ativa"
+           Version="$(Version)"
+           UpgradeCode="6B0F7C1E-3A52-4D8E-9C47-0A1B2C3D4E5F"
+           Language="1046"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="Já existe uma versão mais nova do Korvon Macro instalada." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Korvon Macro">
+        <Component Id="MainExe" Guid="*">
+          <File Id="KorvonMacroExe" Source="$(ExePath)" KeyPath="yes">
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Korvon Macro" Advertise="yes" />
+          </File>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Korvon Macro" Level="1">
+      <ComponentRef Id="MainExe" />
+    </Feature>
+  </Package>
+</Wix>
