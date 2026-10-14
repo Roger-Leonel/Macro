@@ -37,7 +37,9 @@ jobs:
           $version = $env:TAG.TrimStart('v')
           dotnet tool install --global wix --version 5.0.2
           New-Item -ItemType Directory -Force dist | Out-Null
-          wix build installer\korvon-macro.wxs -arch x64 -d Version=$version -d ExePath=target\release\korvon-macro.exe -o "dist\korvon-macro-$version-x64.msi"
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "wix extension falhou ($LASTEXITCODE)" }
+          wix build installer\korvon-macro.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=$version -d ExePath=target\release\korvon-macro.exe -o "dist\korvon-macro-$version-x64.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix falhou ($LASTEXITCODE)" }
 
       - name: Publicar release

@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Instalador MSI do Korvon Macro (WiX v4+).
-  wix build installer\korvon-macro.wxs -arch x64 -d Version=1.0.0 -d ExePath=target\release\korvon-macro.exe -o dist\korvon-macro-1.0.0-x64.msi
+  wix extension add -g WixToolset.UI.wixext/5.0.2
+  wix build installer\korvon-macro.wxs -ext WixToolset.UI.wixext -arch x64 -d Version=1.0.0 -d ExePath=target\release\korvon-macro.exe -o dist\korvon-macro-1.0.0-x64.msi
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Korvon Macro"
            Manufacturer="Fórmula Ativa"
            Version="$(Version)"
@@ -23,6 +24,13 @@
         </Component>
       </Directory>
     </StandardDirectory>
+
+    <!-- Assistente: Boas-vindas -> Pasta de instalação -> Instalar -> Concluído (sem tela de licença). -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="99" Condition="NOT Installed" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="99" />
+    </UI>
 
     <Feature Id="Main" Title="Korvon Macro" Level="1">
       <ComponentRef Id="MainExe" />
