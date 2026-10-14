@@ -8,7 +8,7 @@
 
 #define AppName      "Korvon Macro"
 #define AppPublisher "Fórmula Ativa"
-#define AppURL       "https://github.com/formula-ativa/korvon-macro"
+#define AppURL       "https://github.com/dev-formula-ativa/Korvon-Macro"
 #define AppExeName   "korvon-macro.exe"
 #define DistDir      "..\dist\installer"
 
